@@ -149,6 +149,24 @@ claim_id,employee,dept,order_no,order_date,claim_date,declared_amount,declared_i
 
 ---
 
+## 在 WorkBuddy 里用（含真实调用记录）
+
+本项目在 WorkBuddy 中通过**自定义 MCP 连接器**真实接入过麦当劳 MCP，不是纸面集成：
+
+- 连接器配置：`~/.workbuddy/mcp.json` → `mcd-mcp`（streamablehttp + Bearer），在连接器管理页「自定义连接器」入口点「信任」后启用
+- 会话内工具命名空间：`mcp__mcd-mcp__order-list` / `query-order` / `calculate-price` 等共 35 个
+- **真实会话记录**（公开可核验）：https://workbuddy.link/p/Gugbs7HXP2H8L3RhemB0RC
+- 完整对话与由此得到的 4 条接口结论：[`workbuddy.md`](workbuddy.md)
+
+用自然语言驱动一次稽核的典型指令：
+
+```
+读取 examples/expense_sample.csv 作为报销申报表，用 mcd-mcp 取每笔订单的
+订单详情与官方核价，按 SKILL.md 的 7 条控制测试出稽核底稿，标注数据来源。
+```
+
+---
+
 ## 目录结构
 
 ```
