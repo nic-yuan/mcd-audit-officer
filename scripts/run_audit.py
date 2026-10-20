@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from audit_engine import Auditor, Policy, OrderFact, load_claims_csv, render_markdown, report_to_dict  # noqa: E402
+from mcp_client import to_yuan  # noqa: E402
 from sample_data import load_sample_claims, sample_facts, AVAILABLE_COUPONS  # noqa: E402
 
 
@@ -49,6 +50,41 @@ def build_mcp_enricher(verbose: bool = False):
         print(f"[warn] MCP 初始化失败，全程降级为离线基准：{e}", file=sys.stderr)
         return None
 
+    menu_cache: dict[str, dict[str, str]] = {}
+    store_by_order: dict[str, str] | None = None
+
+    def _store_lookup() -> dict[str, str]:
+        """
+        query-order **不返回 storeCode**（只有 storeName / storeAddress），
+        而 calculate-price 必须要 storeCode。所以先用 order-list 建
+        「orderId -> storeCode」索引来补这一环。
+
+        这是实测才发现的坑：不补这一步，核价整条链路会被静默跳过，
+        底稿上看不出任何异常，只是 R01 永远不命中。
+        """
+        nonlocal store_by_order
+        if store_by_order is None:
+            store_by_order = {}
+            payload = _pick_data(client.list_orders())
+            rows = (payload or {}).get("list") if isinstance(payload, dict) else None
+            for row in rows or []:
+                oid = row.get("orderId")
+                sc = row.get("storeCode")
+                if oid and sc:
+                    store_by_order[str(oid)] = str(sc)
+            if verbose:
+                print(f"[mcp] order-list 索引 {len(store_by_order)} 笔", file=sys.stderr)
+        return store_by_order
+
+    def _index_for(store_code: str, order_type: int, be_type: int) -> dict[str, str]:
+        """按门店缓存「品项名 -> productCode」索引，避免每笔申报都重拉菜单。"""
+        key = f"{store_code}:{order_type}:{be_type}"
+        if key not in menu_cache:
+            menu_cache[key] = _menu_index(
+                client.query_meals(store_code, order_type=order_type, be_type=be_type)
+            )
+        return menu_cache[key]
+
     def enrich(claim, ctx) -> dict:
         out: dict = {}
         if claim.order_no in cache:
@@ -56,24 +92,58 @@ def build_mcp_enricher(verbose: bool = False):
 
         facts = ctx.get("_facts", {})
         order = facts.get(claim.order_no)
+        raw_order: dict | None = None
 
-        # 订单事实优先取 MCP
+        # 订单事实优先取 MCP（query-order 用 orderId，即订单编码）
         try:
-            raw = client.fetch_order(claim.order_no)
-            if isinstance(raw, dict) and raw:
-                order = _coerce_order(claim.order_no, raw, order)
+            resp = client.fetch_order(claim.order_no)
+            raw_order = _pick_data(resp)
+            if isinstance(raw_order, dict) and raw_order:
+                order = _coerce_order(claim.order_no, raw_order, order)
+                if not order.store_id:
+                    order.store_id = _store_lookup().get(str(claim.order_no), "")
+                    if verbose and not order.store_id:
+                        print(
+                            f"[warn] {claim.order_no} 无法从 order-list 补到 storeCode，核价将跳过",
+                            file=sys.stderr,
+                        )
                 facts[claim.order_no] = order
         except McpError as e:
             if verbose:
                 print(f"[warn] {claim.order_no} 取订单失败：{e}", file=sys.stderr)
 
-        # 官方核价
+        # 官方核价（calculate-price；beType/orderType 以订单实际渠道为准）
         if order and order.store_id:
             try:
-                bp = client.benchmark_price(order.store_id, _items_payload(order.items))
-                amount = _dig_amount(bp)
-                if amount is not None:
-                    out["benchmark"] = amount
+                ot = _as_int((raw_order or {}).get("orderType"), 1)
+                bt = _as_int((raw_order or {}).get("beType"), 1)
+                idx = _index_for(order.store_id, ot, bt)
+                items, missing = _items_payload(list(order.items or []), idx)
+                if missing:
+                    # 基准残缺：宁可不出价差结论，也不拿残缺基准造缺陷。
+                    out["benchmark_incomplete"] = missing
+                    if verbose:
+                        print(
+                            f"[warn] {claim.order_no} 有 {len(missing)} 个品项未映射到 productCode"
+                            f"（{missing[:3]}），核价基准不完整 → 放弃价差判定",
+                            file=sys.stderr,
+                        )
+                elif items:
+                    bp = client.benchmark_price(
+                        order.store_id, items, order_type=ot, be_type=bt
+                    )
+                    # ⚠️ calculate-price 金额单位是「分」
+                    amount = _dig_amount(_pick_data(bp), unit="cent")
+                    if amount is not None:
+                        out["benchmark"] = amount
+                        if verbose:
+                            print(
+                                f"[mcp] {claim.order_no} 核价 {amount:.2f} 元 "
+                                f"（items={len(items)}，store={order.store_id}）",
+                                file=sys.stderr,
+                            )
+                    elif verbose:
+                        print(f"[mcp] {claim.order_no} 核价未取到金额", file=sys.stderr)
             except McpError:
                 pass
 
@@ -81,7 +151,7 @@ def build_mcp_enricher(verbose: bool = False):
         try:
             coupons = client.my_coupons()
             if isinstance(coupons, (list, dict)):
-                ids = _dig_coupon_ids(coupons)
+                ids = _dig_coupon_ids(_pick_data(coupons))
                 if ids:
                     out["coupons"] = ids
         except McpError:
@@ -93,27 +163,100 @@ def build_mcp_enricher(verbose: bool = False):
     return enrich
 
 
-def _items_payload(items: list[str]) -> list[dict]:
-    """把品项名转成核价入参。真实使用时应按餐品编码传参，此处仅作演示。"""
-    return [{"name": it} for it in items]
+def _pick_data(payload):
+    """官方响应形如 {code, message, data}，这里把 data 层剥出来。"""
+    if isinstance(payload, dict) and isinstance(payload.get("data"), (dict, list)):
+        return payload["data"]
+    return payload
 
 
-def _dig_amount(payload) -> float | None:
-    """从 MCP 返回里尽量抠出金额字段，兼容不同层级结构。"""
+def _as_int(value, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+
+def _norm_name(s) -> str:
+    """品项名归一化：去空白、统一全半角括号、去间隔号，提升菜单匹配率。"""
+    s = str(s).strip().lower()
+    for a, b in (("（", "("), ("）", ")"), ("　", ""), (" ", ""), ("·", ""), ("•", "")):
+        s = s.replace(a, b)
+    return s
+
+
+def _items_payload(items: list[str], index: dict[str, str] | None = None) -> tuple[list[dict], list[str]]:
+    """
+    把品项名转成 calculate-price 的入参：[{"productCode": "9900005456", "quantity": 1}]。
+
+    真实接口只认 productCode，不认品项名，所以必须先用 query-meals 建索引。
+    返回 (可核价品项, 未能映射的品项名)。
+
+    ⚠️ 只要有品项映射不上，核价基准就是残缺的 —— 调用方**必须**放弃价差判定，
+    否则会拿「少算了几样的价格」去对「完整订单金额」，凭空造出假价差。
+    """
+    idx = index or {}
+    out: list[dict] = []
+    missing: list[str] = []
+    for it in items:
+        code = idx.get(_norm_name(it)) or idx.get(it)
+        if code:
+            out.append({"productCode": code, "quantity": 1})
+        else:
+            missing.append(it)
+    return out, missing
+
+
+def _menu_index(payload) -> dict[str, str]:
+    """从 query-meals 返回里建「品项名 -> productCode」索引（含归一化键）。
+
+    实测 data.meals 是 {productCode: {name, currentPrice, originalPrice}} 映射。
+    """
+    idx: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return idx
+    data = payload.get("data") if "data" in payload else payload
+    meals = (data or {}).get("meals") if isinstance(data, dict) else None
+    if isinstance(meals, dict):
+        for code, info in meals.items():
+            name = (info or {}).get("name") if isinstance(info, dict) else None
+            if name and code:
+                idx[str(name)] = str(code)
+                idx[_norm_name(name)] = str(code)
+    elif isinstance(meals, list):
+        for m in meals:
+            if isinstance(m, dict) and m.get("productCode") and m.get("name"):
+                idx[str(m["name"])] = str(m["productCode"])
+                idx[_norm_name(m["name"])] = str(m["productCode"])
+    return idx
+
+
+
+def _dig_amount(payload, unit: str = "yuan") -> float | None:
+    """
+    从 MCP 返回里抠出金额，统一成「元」。
+
+    unit 必须由调用方指定：订单接口是「元」，calculate-price 是「分」。
+    自动猜测单位在这个场景里是危险的 —— 猜错会让 112.4 变成 11240。
+    """
     if payload is None:
         return None
-    if isinstance(payload, (int, float)):
-        return float(payload)
+    if isinstance(payload, (int, float, str)):
+        return to_yuan(payload, unit)
     if isinstance(payload, dict):
-        for key in ("payAmount", "totalAmount", "amount", "payable", "total", "price"):
+        for key in ("payAmount", "realTotalAmount", "totalAmount", "price", "amount", "payable", "total"):
             v = payload.get(key)
-            if isinstance(v, (int, float)):
-                return float(v)
+            if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+                got = to_yuan(v, unit)
+                if got is not None:
+                    return got
         for v in payload.values():
-            got = _dig_amount(v)
+            got = _dig_amount(v, unit)
             if got is not None:
                 return got
     return None
+
 
 
 def _dig_coupon_ids(payload) -> list[str]:
@@ -135,20 +278,44 @@ def _dig_coupon_ids(payload) -> list[str]:
 
 
 def _coerce_order(order_no: str, raw: dict, fallback: OrderFact | None) -> OrderFact:
-    """把 MCP 返回的订单结构收敛到 OrderFact。字段缺失时保留样例值。"""
+    """
+    把 query-order 的真实返回收敛到 OrderFact。
+
+    实测字段（2026-10-20 对 mcp.mcd.cn）：
+      orderId / storeCode / storeName / createTime
+      / realTotalAmount（单位「元」）/ totalDiscountAmount
+      / orderProductList[{productCode, productName, quantity, comboItemList}]
+      / couponList / takeWay
+    """
     base = fallback or OrderFact(order_no=order_no, source="mcp")
-    paid = _dig_amount(raw)
+    paid = _dig_amount(raw, unit="yuan")  # 订单侧金额是「元」
+
+    names: list[str] = []
+    for p in raw.get("orderProductList") or []:
+        if isinstance(p, dict) and p.get("productName"):
+            names.append(str(p["productName"]))
+
+    coupons: list[str] = []
+    for cc in raw.get("couponList") or []:
+        if isinstance(cc, dict):
+            val = cc.get("code") or cc.get("couponCode") or cc.get("name")
+            if val:
+                coupons.append(str(val))
+        elif cc:
+            coupons.append(str(cc))
+
     return OrderFact(
         order_no=order_no,
-        store_id=str(raw.get("storeId") or raw.get("storeCode") or base.store_id or ""),
+        store_id=str(raw.get("storeCode") or raw.get("storeId") or base.store_id or ""),
         store_name=str(raw.get("storeName") or base.store_name or ""),
-        order_time=str(raw.get("orderTime") or raw.get("createTime") or base.order_time or ""),
+        order_time=str(raw.get("createTime") or raw.get("orderTime") or base.order_time or ""),
         paid_amount=paid if paid is not None else base.paid_amount,
-        items=raw.get("items") or raw.get("mealList") or base.items or [],
-        coupons_used=raw.get("coupons") or base.coupons_used or [],
-        channel=str(raw.get("channel") or raw.get("orderType") or base.channel or ""),
+        items=names or base.items or [],
+        coupons_used=coupons or base.coupons_used or [],
+        channel=str(raw.get("takeWay") or raw.get("orderType") or base.channel or ""),
         source="mcp",
     )
+
 
 
 def main() -> int:
@@ -192,12 +359,9 @@ def main() -> int:
             print("[warn] MCP 不可用，本次按离线基准执行", file=sys.stderr)
         else:
             data_source = "mcp"
-            # 离线样例场景下补充券信息，便于演示 R02
-            def _with_default_coupons(c, ctx, _inner=enrich):
-                out = _inner(c, ctx) or {}
-                out.setdefault("coupons", AVAILABLE_COUPONS)
-                return out
-            enrich = _with_default_coupons
+            # 真实模式下**绝不注入示例券**。
+            # 早期版本在这里 setdefault 了 AVAILABLE_COUPONS，会让 R02 拿演示券当真实证据，
+            # 与「降级必须可见、不给虚假结论」的原则直接冲突，已移除。
 
     # 4) 执行
     if args.csv:
