@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 绝不提交真实凭据
+.env
+*.token
+mcp-config.json
+!mcp-config.example.json
+
+# 输出产物（样例输出除外）
+result.json
+audit_report.md
+!examples/expected_output.md
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

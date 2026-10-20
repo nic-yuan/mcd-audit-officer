@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "mcd-mcp": {
+      "type": "streamablehttp",
+      "url": "https://mcp.mcd.cn",
+      "headers": {
+        "Authorization": "Bearer ${MCD_MCP_TOKEN}"
+      }
+    }
+  },
+  "_说明": [
+    "本文件为脱敏示例，仅使用环境变量占位符，不含任何真实 Token。",
+    "申请 Token：https://open.mcd.cn/mcp （手机号登录 → 控制台 → 激活）",
+    "运行前：export MCD_MCP_TOKEN=你的Token",
+    "切勿将真实 Token 提交进版本库。"
+  ]
+}
