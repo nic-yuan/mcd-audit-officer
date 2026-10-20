@@ -4,7 +4,7 @@
 mcd-audit-officer · MCP 客户端（麦当劳 MCP Server）
 
 只依赖 Python 标准库，无第三方包。
-传输：Streamable HTTP（MCP spec 2025-11-25+）
+传输：Streamable HTTP（实测服务端协商版本 2025-06-18）
 鉴权：Authorization: Bearer <MCD_MCP_TOKEN>
 
 设计原则：
@@ -21,7 +21,8 @@ import urllib.request
 from typing import Any
 
 MCP_URL = "https://mcp.mcd.cn"
-PROTOCOL_VERSION = "2025-11-25"
+# 实测：服务端实际返回 protocolVersion = 2025-06-18（会与客户端取交集）。
+PROTOCOL_VERSION = "2025-06-18"
 
 
 class McpError(RuntimeError):
@@ -97,6 +98,30 @@ class McdMcpClient:
                     continue
         raise McpError(f"无法解析响应: {raw[:200]}")
 
+    @staticmethod
+    def _extract_json(text: str) -> Any | None:
+        """
+        官方工具返回的 text 是「Markdown 字段说明 + 原始 JSON」的混合体，
+        直接 json.loads 会失败。此处扫描所有 '{' 起点，取跨度最大的合法 JSON。
+
+        这是踩过的坑：按纯 JSON 解析会导致 35 个工具全部「调用成功但取不到值」，
+        比报错更危险 —— 稽核会静默降级成「无法取证」。
+        """
+        dec = json.JSONDecoder()
+        best: tuple[int, Any] | None = None
+        i = text.find("{")
+        while i != -1:
+            try:
+                obj, end = dec.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                i = text.find("{", i + 1)
+                continue
+            if best is None or end > best[0]:
+                best = (end, obj)
+            i = text.find("{", i + 1)
+        return best[1] if best else None
+
+
     def initialize(self) -> dict | None:
         return self._rpc(
             "initialize",
@@ -128,9 +153,9 @@ class McdMcpClient:
             raise McpError(str(resp["error"]))
         return self._unwrap(result)
 
-    @staticmethod
-    def _unwrap(result: dict) -> Any:
-        """把 MCP content 数组还原成 Python 对象。"""
+    @classmethod
+    def _unwrap(cls, result: dict) -> Any:
+        """把 MCP content 数组还原成 Python 对象（兼容混合文本）。"""
         content = result.get("content", [])
         texts: list[str] = []
         for item in content:
@@ -139,63 +164,110 @@ class McdMcpClient:
         joined = "\n".join(texts).strip()
         if not joined:
             return result
-        try:
-            return json.loads(joined)
-        except json.JSONDecodeError:
-            return joined
+        got = cls._extract_json(joined)
+        return got if got is not None else joined
 
     # ---------- 审计业务封装 ----------
-    # 每个方法都对应一条稽核规则的"应然基准"取数路径。
+    # 参数名以 2026-10-20 对 mcp.mcd.cn 实测的 inputSchema 为准（非推测）。
+    # 单位约定：calculate-price 返回「分」，订单接口返回「元」—— 详见 cents_to_yuan 说明。
 
-    def fetch_order(self, order_no: str) -> dict | None:
-        """query-order：订单事实（金额、品项、时间、门店）。"""
+    def fetch_order(self, order_id: str) -> dict | None:
+        """query-order：订单事实。必填 orderId（订单编码，不是自定义单号）。"""
         try:
-            return self.call_tool("query-order", {"orderNo": order_no})
+            return self.call_tool("query-order", {"orderId": order_id})
         except McpError:
             return None
 
-    def list_orders(self, **kwargs) -> Any:
-        """order-list：历史订单（到店/外送）。"""
+    def list_orders(self) -> Any:
+        """order-list：历史订单列表。该工具不接受任何参数。"""
         try:
-            return self.call_tool("order-list", kwargs)
+            return self.call_tool("order-list", {})
         except McpError:
             return None
 
-    def benchmark_price(self, store_id: str, items: list[dict], coupon_ids: list[str] | None = None) -> dict | None:
-        """calculate-price：官方核价，作为价差异常的'应然基准'。"""
+    def query_meals(self, store_code: str, order_type: int = 1, be_type: int = 1) -> Any:
+        """
+        query-meals：门店菜单。
+        实测返回 data.meals 是 {productCode: {name, currentPrice, originalPrice}} 映射，
+        不是数组 —— 取数时勿按 list 迭代。
+        """
         try:
             return self.call_tool(
-                "calculate-price",
-                {"storeId": store_id, "items": items, "couponIds": coupon_ids or []},
+                "query-meals",
+                {"storeCode": store_code, "orderType": order_type, "beType": be_type},
             )
         except McpError:
             return None
 
-    def meal_detail(self, meal_code: str) -> dict | None:
-        """query-meal-detail：套餐构成，用于串项核查。"""
+    def benchmark_price(
+        self,
+        store_code: str,
+        items: list[dict],
+        order_type: int = 1,
+        be_type: int = 1,
+        be_code: str | None = None,
+        gm_service_code: str | None = None,
+        reservation_date: str | None = None,
+    ) -> dict | None:
+        """
+        calculate-price：官方核价，作为价差异常的「应然基准」。
+
+        items 结构： [{"productCode": "9900005456", "quantity": 1}]
+        beType 取值：1 到店 / 2 麦乐送 / 5 得来速 / 6 企业团餐
+        返回字段： price / originalPrice / productPrice（**单位：分**）
+        """
+        args: dict[str, Any] = {
+            "storeCode": store_code,
+            "orderType": order_type,
+            "beType": be_type,
+            "items": items,
+        }
+        if be_code:
+            args["beCode"] = be_code
+        if gm_service_code:
+            args["gmServiceCode"] = gm_service_code
+        if reservation_date:
+            args["reservationDate"] = reservation_date
         try:
-            return self.call_tool("query-meal-detail", {"mealCode": meal_code})
+            return self.call_tool("calculate-price", args)
         except McpError:
             return None
 
-    def my_coupons(self) -> Any:
-        """query-my-coupons：券持有情况，用于券未核销核查。"""
+    def meal_detail(
+        self, store_code: str, code: str, order_type: int = 1, be_type: int = 1
+    ) -> dict | None:
+        """query-meal-detail：套餐构成，用于串项核查。参数是 code（餐品编码）不是 mealCode。"""
         try:
-            return self.call_tool("query-my-coupons", {})
+            return self.call_tool(
+                "query-meal-detail",
+                {"storeCode": store_code, "code": code, "orderType": order_type, "beType": be_type},
+            )
         except McpError:
             return None
 
-    def store_coupons(self, store_id: str) -> Any:
-        """query-store-coupons：门店可用券。"""
+    def my_coupons(self, page: int = 1, page_size: int = 200) -> Any:
+        """query-my-coupons：卡包券资产。注意它不校验门店/渠道可用性。"""
         try:
-            return self.call_tool("query-store-coupons", {"storeId": store_id})
+            return self.call_tool("query-my-coupons", {"page": str(page), "pageSize": str(page_size)})
         except McpError:
             return None
 
-    def meal_assistance(self, store_id: str) -> Any:
-        """query-meal-assistance：企业团餐助餐服务（B 端场景）。"""
+    def store_coupons(self, store_code: str, order_type: int = 1, be_type: int = 1) -> Any:
+        """query-store-coupons：当前门店/渠道可用的券（比 my_coupons 更贴近下单规则）。"""
         try:
-            return self.call_tool("query-meal-assistance", {"storeId": store_id})
+            return self.call_tool(
+                "query-store-coupons",
+                {"storeCode": store_code, "orderType": order_type, "beType": be_type},
+            )
+        except McpError:
+            return None
+
+    def meal_assistance(self, store_code: str, order_type: int = 2) -> Any:
+        """query-meal-assistance：企业团餐助餐服务。beType 固定 6，仅团餐场景。"""
+        try:
+            return self.call_tool(
+                "query-meal-assistance", {"storeCode": store_code, "beType": 6, "orderType": order_type}
+            )
         except McpError:
             return None
 
@@ -207,23 +279,46 @@ class McdMcpClient:
             return None
 
 
+
+# ---------- 单位换算 ----------
+# 实测差异（2026-10-20）：
+#   calculate-price  -> price / originalPrice / productPrice  单位「分」（3350 即 33.5 元）
+#   query-order      -> realTotalAmount / totalAmount          单位「元」（"112.4"）
+# 审核必须先统一计量单位。漏了这一步，价差会凭空放大 100 倍，
+# 整个底稿会变成一堆假缺陷 —— 对审计来说，假缺陷比漏报更伤可信度。
+
+def to_yuan(value: Any, unit: str = "yuan") -> float | None:
+    """把金额统一成「元」。unit 取 'yuan' 或 'cent'。"""
+    if value is None:
+        return None
+    try:
+        v = float(str(value).replace(",", "").replace("¥", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return round(v / 100, 2) if unit == "cent" else round(v, 2)
+
+
 def probe(token: str | None = None) -> dict:
     """
     连通性自检。用于 README 的"跑通第一次调用"，也用于确认 Token 有效。
-    返回 {ok, tools, error}
+    返回 {ok, tool_count, tools, server, error}
     """
     client = McdMcpClient(token=token)
     try:
-        client.initialize()
+        init = client.initialize() or {}
         tools = client.list_tools()
+        server = (init.get("result") or {}).get("serverInfo") or {}
         return {
             "ok": len(tools) > 0,
             "tool_count": len(tools),
+            "server": server.get("name") or "",
+            "protocol": (init.get("result") or {}).get("protocolVersion") or "",
             "tools": [t.get("name") for t in tools][:40],
             "error": None,
         }
     except McpError as e:
-        return {"ok": False, "tool_count": 0, "tools": [], "error": str(e)}
+        return {"ok": False, "tool_count": 0, "tools": [], "server": "", "protocol": "", "error": str(e)}
+
 
 
 if __name__ == "__main__":
