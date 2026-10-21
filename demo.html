@@ -57,9 +57,19 @@ tr:hover td{background:#fafbfc}
 footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);
   color:var(--muted);font-size:12px}
 code{background:#f1f3f7;padding:1px 6px;border-radius:4px;font-size:13px}
+.cta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:linear-gradient(135deg,#eef4ff,#f7f9ff);
+  border:1px solid #cfe0ff;border-radius:12px;padding:12px 16px;margin:16px 0 8px;font-size:14px}
+.cta .txt{flex:1;min-width:220px;color:#1b1f27}
+.cta .txt b{color:var(--accent)}
+.cta a{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;
+  border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;white-space:nowrap}
+.cta a.secondary{background:#fff;color:var(--accent);border:1px solid #cfe0ff}
+.cta-foot{background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:16px 18px;margin-top:28px;font-size:14px}
 </style></head><body><div class='wrap'>
 <h1>麦审官 · 订餐报销稽核底稿</h1>
 <p class='sub'>基于麦当劳 MCP 的企业团餐与订餐报销稽核 Skill　·　<b>脱敏样例数据</b>，不含任何真实订单、真实人名或真实门店</p>
+<div class='cta'><div class='txt'>这是开源项目 <b>麦审官 mcd-audit-officer</b> 的样例输出。它把「申报单 × 订单事实 × 官方核价」做三单交叉，跑 7 条控制测试，输出带证据链与缺陷分级的稽核底稿。</div><a href='https://github.com/nic-yuan/mcd-audit-officer' target='_blank' rel='noopener'>查看源码 · Star</a><a class='secondary' href='https://github.com/nic-yuan/mcd-audit-officer#readme' target='_blank' rel='noopener'>使用说明</a></div>
 <p><span class='badge'>mcd-audit-officer</span><span class='badge'>MCP × 内控审计</span><span class='badge'>零第三方依赖</span></p>
 <div class='flow'>
 <div class='fnode'><div class='k'>应然</div><div class='v'>申报单</div><div class='note'>报销人自述：金额、品项、事由</div></div>
@@ -342,5 +352,6 @@ code{background:#f1f3f7;padding:1px 6px;border-radius:4px;font-size:13px}
 <li>本结果为<b>程序化测试</b>，不等同于审计意见；最终结论须经人工复核并签字确认。</li>
 <li>餐品、价格及供应状态以麦当劳官方渠道实时结果为准。</li>
 </ul></div>
-<footer>由 mcd-audit-officer 生成 · 2026-10-20 14:21:55 · 数据来源：sample · 参赛作品，非麦当劳官方产品</footer>
+<div class='cta-foot'><b>觉得思路有用？</b> 这个项目是开源的，Star 一下是对作者最大的支持。<div style='margin-top:10px'><a href='https://github.com/nic-yuan/mcd-audit-officer' target='_blank' rel='noopener' style='background:var(--accent);color:#fff;text-decoration:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;display:inline-block'>github.com/nic-yuan/mcd-audit-officer</a></div></div>
+<footer>由 mcd-audit-officer 生成 · 2026-10-21 14:00:55 · 数据来源：sample · 参赛作品，非麦当劳官方产品</footer>
 </div></body></html>
